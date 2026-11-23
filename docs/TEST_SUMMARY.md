@@ -2,69 +2,56 @@
 
 Full details: [StreamGrab_Test_Cases.xlsx](StreamGrab_Test_Cases.xlsx) · Plan: [StreamGrab Test Plan.pdf](StreamGrab%20Test%20Plan.pdf)
 
-Test environment: Windows 10 22H2 (build 19045), 1366×768, yt-dlp 2026.10.26, FFmpeg 9.0.2, Deno 2.9.8.
-Test data: public Blender Foundation videos (Big Buck Bunny 4K60, Blender HQ playlist) and "Me at the zoo".
+Test environment: Windows 10 22H2 (build 19045), 1366×768, yt-dlp 2026.10.26 (2026.10.21 for the engine-update tests), FFmpeg 9.0.2, Deno 2.9.8.
+Test data: public Blender Foundation videos (Big Buck Bunny 4K60, Blender HQ playlist), "Me at the zoo" and a Blender Short.
 
 ## Results by cycle
 
 | Cycle | Build | Executed | Pass | Fail | Blocked | Not run | Defects found | Open at end |
 |---|---|---|---|---|---|---|---|---|
 | 1 | 1.0.0 | 83 | 78 | 4 | 1 | 18 | 9 | 9 |
-| 2 | 1.0.1 | 101 | **94** | **0** | 7 | **0** | 7 | **0** |
+| 2 | 1.0.1 | 101 | 94 | 0 | 7 | 0 | 7 | 0 |
+| 3 | 1.1.0 | 129 | **121** | **0** | 8 | 1 | 9 | **0** |
 
-All 16 defects are fixed in 1.0.1 and were retested.
+Cycle 3 added 29 cases for the three new features (download queue, engine updates, portable mode) and re-ran every
+existing case the changes touch: all download modes, progress, cancel, playlists, the existing-file prompt, settings,
+error handling and performance. Cases the changes don't touch keep their 1.0.1 result (marked as such in the workbook).
 
-## Results by area (1.0.1)
+## New in 1.1.0: what was tested
 
-| Area | Cases | Pass | Blocked |
+| Area | Cases | How |
+|---|---|---|
+| Download queue | QU-01 … QU-14 | App (UI) and `tests/test_queue.py`: 2 at a time, cancel one, pause/resume from the partial file, closing and reopening mid-download, worker killed, file-exists rules, playlists split per video, two downloads into the same name, restore then add more |
+| Engine updates | EU-01 … EU-09 | `tests/test_engine_update.py` with an older yt-dlp bundled, from source **and in the packaged exe**: update downloaded, SHA-256 checked, self-tested, used by new downloads; broken engine rejected and skipped; YouTube-change errors detected. Daily check + "Restart now" tested in the app |
+| Portable mode | PT-01 … PT-06 | Portable zip run from a test folder: settings in `StreamGrab.ini`, data in `data\`, registry and AppData unchanged; read-only folder falls back to normal mode; engine updates stay in the folder |
+
+## Defects found in cycle 3 (all fixed in 1.1.0)
+
+| ID | Severity | Problem | Fix |
 |---|---|---|---|
-| Loading links | 15 | 15 | 0 |
-| Video + Audio | 10 | 10 | 0 |
-| Video only | 4 | 4 | 0 |
-| Audio only | 12 | 12 | 0 |
-| Save location | 9 | 9 | 0 |
-| Progress | 7 | 7 | 0 |
-| Cancel | 5 | 5 | 0 |
-| Playlists | 7 | 7 | 0 |
-| Settings | 9 | 7 | 2 |
-| Error handling | 8 | 6 | 2 |
-| Performance | 7 | 7 | 0 |
-| Compatibility | 5 | 3 | 2 |
-| Usability | 3 | 2 | 1 |
-| **Total** | **101** | **94** | **7** |
-
-## Defects (all closed)
-
-| ID | Severity | Problem | Fix in 1.0.1 |
-|---|---|---|---|
-| BUG-001 | Low | Non-link text became "https://…" with a technical error | Plain "That doesn't look like a link" message |
-| BUG-002 | Low | Audio quality ignored for M4A/AAC/Opus | Chosen bitrate is now really used |
-| BUG-003 | Medium | Re-download silently kept the old file | "File already exists": Replace / Keep both / Cancel |
-| BUG-004 | Low | Title bar didn't follow theme until restart | Repaints immediately |
-| BUG-005 | Medium | Clipboard auto-fill could replace a typed link | Only fills links that are new on the clipboard |
-| BUG-006 | Low | Raw "unavailable video" error text | Friendly message |
-| BUG-007 | Low | "Clipboard is empty" hid the loaded video | Shown in the status area |
-| BUG-008 | Medium | Cancel during merge/convert left temp files | Everything the job created is removed |
-| BUG-009 | Low | AVI conversion labelled "Merging" | "Converting to AVI" |
-| BUG-010 | Medium | No visible keyboard focus | Focus outline on every control |
-| BUG-011 | Low | Controls unnamed for screen readers | Accessible names added |
-| BUG-012 | Medium | FFmpeg-missing warning hidden; Download still enabled | Persistent warning, Download disabled |
-| BUG-013 | Low | Focus started on the theme button | Starts in the link box |
-| BUG-014 | Low | Raw WinError text when update check is offline | "No internet connection" |
-| BUG-015 | High | Lost connection mid-download reported as "complete" | Reported as failed; retry resumes |
-| BUG-016 | Medium | Settings taller than the screen at 125% scaling | Settings scrolls; Done always visible |
+| BUG-017 | Medium | A download finishing while the app closed was downloaded again after restart ("(2)" duplicate) | Late messages after closing are ignored; real state saved |
+| BUG-018 | Low | Paused download lost its progress bar | Last progress kept |
+| BUG-019 | Medium | No way to resume one paused download | Resume button on each row |
+| BUG-020 | Medium | Several copied links auto-filled as one "link" at start | Auto-fill ignores text with line breaks |
+| BUG-021 | Low | "Didn't finish last time" notice stayed after opening the Queue tab | Notice closes there |
+| BUG-022 | Low | Audio size estimate left out the cover art (since 1.0.0; 4–26% low) | Cover counted; estimates within 2% |
+| BUG-023 | Medium | Two downloads started together picked the same "(2)" name; resume picked a new one | Names reserved while downloading; chosen name saved |
+| BUG-024 | Medium | Downloads took 7–9 s to start (target 3 s) | Only the named thumbnail fetched + a worker kept ready: 1.6–1.9 s |
+| BUG-025 | Medium | After restoring unfinished downloads, new ones never started | Pausing is per item; new downloads always start |
 
 ## Highlights
 
-- Every download mode and format verified with ffprobe, including 4K60 AV1; size estimates within 1%.
-- Link loading about 2.3 s (median); downloads run at full line speed (5.3 MB/s vs 4.4–6.4 MB/s speed test).
-- 20 downloads in one session: no failures, memory flat at ~87 MB.
-- Network loss and offline tests were simulated with a local proxy (`tests/netsim.py`).
+- Every download mode and format re-verified with ffprobe (27 runner cases), including 4K60 and AV1.
+- Size estimates: video within 1%, audio within 2% (was up to 26% low).
+- Downloads start in 1.6–1.9 s and run at full line speed (6.0–6.2 MB/s); links load in about 2.2 s.
+- 9 automated queue scenarios and 9 engine-update checks pass on the final code.
+- The packaged exe loads an updated engine from its data folder, so YouTube changes can be fixed without a new release.
 
 ## Still blocked (need other hardware or a person)
 
 | Case | Needs |
 |---|---|
+| QU-13 (Low) | A person to watch for the Windows notification when downloads finish (the taskbar flash was verified) |
 | CP-01 (Critical) | A clean PC / VM without Python |
 | CP-02 (High) | A real Windows 11 high-DPI screen (125% scaling was simulated and passes) |
 | ST-02 | Changing the Windows theme |
@@ -73,8 +60,16 @@ All 16 defects are fixed in 1.0.1 and were retested.
 | ER-06 | A nearly full USB drive |
 | US-01 | A first-time human tester |
 
-## Installer (StreamGrab_Setup_1.0.1.exe)
+## Installer and portable zip (1.1.0)
 
-Checked on the same PC: fresh install (per-user, no admin), app runs with nothing else on PATH, upgrade while the
-app is open (closes it automatically), and uninstall while the app is open (offers to close it; removes all program
-files and shortcuts; settings kept on request; downloads never touched).
+- **StreamGrab_Setup_1.1.0.exe** (184 MB): 1.0.1 installed, then upgraded to 1.1.0 while 1.0.1 was running (closed
+  automatically). Uninstall entry shows 1.1.0; settings kept; the installed app passes the engine self-test; uninstalls cleanly.
+- **StreamGrab_Portable_1.1.0.zip** (268 MB): unzipped and run from a test folder; settings in `StreamGrab.ini`, data in
+  `data\`; registry and AppData unchanged; folder moved and settings came along; deleting `portable.txt` switches back to
+  normal mode. From a read-only folder it runs in normal mode with a notice.
+
+Not run yet: EU-09 (new-version notice) needs the 1.1.0 release to be published first.
+
+## Earlier cycles
+
+Cycle 2 (1.0.1) closed all 16 defects from 1.0.0 (BUG-001 … BUG-016); see the Defect Log sheet.

@@ -3,6 +3,14 @@ import sys
 
 
 def main():
+    args = sys.argv[1:]
+    if len(args) >= 2 and args[0] == "--worker":          # one queued download (no window)
+        from .worker import run_worker
+        sys.exit(run_worker(args[1]))
+    if len(args) >= 2 and args[0] == "--engine-selftest":  # checks a newly downloaded engine
+        from .worker import run_selftest
+        sys.exit(run_selftest(args[1]))
+
     if os.name == "nt":
         try:
             import ctypes

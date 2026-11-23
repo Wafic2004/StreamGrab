@@ -23,6 +23,11 @@ G_CHECK = ""
 G_ERROR = ""
 G_REFRESH = ""
 G_LIST = ""
+G_PAUSE = chr(0xE769)
+G_DELETE = chr(0xE74D)
+G_CLEAR = chr(0xE8E6)
+G_INFO = chr(0xE946)
+G_SYNC = chr(0xE895)
 
 _glyph_family = None
 

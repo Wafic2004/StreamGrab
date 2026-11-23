@@ -204,4 +204,22 @@ class Analysis:
             desc = f"{sname} {sbr} kbps source   →   {label} {q} kbps" if q else f"{sname} {sbr} kbps source   →   {label} (best VBR)"
             if q and sbr and q > sbr * 1.6:
                 warn.append(f"The source is ~{sbr} kbps, so {q} kbps won't sound better than that. It only makes the file bigger.")
+        if size and spec.get("embed_cover", True) and fmt != "wav":
+            size += self.cover_bytes(base64=fmt in ("opus", "vorbis"))
         return dict(size=size, desc=desc, warnings=warn, streams=1)
+
+    def cover_bytes(self, base64=False):
+        """Approximate size of the embedded cover art: the thumbnail YouTube names for the video. A JPEG
+        is embedded as it is (~0.12 bytes per pixel); WebP is converted to PNG first (~1.1 bytes per pixel).
+        Opus/OGG store the picture base64-encoded (x1.34). The sizes listed for thumbnails aren't
+        reliable (maxresdefault is listed as 1920x1080 but is 1280x720), so go by YouTube's name."""
+        url = (self.info.get("thumbnail") or "").lower()
+        for name, (w, h) in (("maxres", (1280, 720)), ("sddefault", (640, 480)), ("hqdefault", (480, 360)),
+                             ("mqdefault", (320, 180))):
+            if name in url:
+                break
+        else:
+            w, h = 480, 360
+        webp = ".webp" in url.split("?")[0] or "/vi_webp/" in url
+        b = int(w * h * (1.1 if webp else 0.12))
+        return int(b * 1.34) if base64 else b

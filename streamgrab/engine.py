@@ -58,8 +58,29 @@ def _wheel_version(path):
     return parts[1] if len(parts) > 1 else "0"
 
 
-def _latest_wheel(pkg):
-    wheels = glob.glob(os.path.join(ENGINE_DIR, f"{pkg}-*-py3-none-any.whl"))
+ENGINE_STATE = os.path.join(ENGINE_DIR, "state.json")
+
+
+def engine_state():
+    try:
+        with open(ENGINE_STATE, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_engine_state(st):
+    os.makedirs(ENGINE_DIR, exist_ok=True)
+    tmp = ENGINE_STATE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(st, f, indent=1)
+    os.replace(tmp, ENGINE_STATE)
+
+
+def _latest_wheel(pkg, include_bad=False):
+    bad = set() if include_bad else set(engine_state().get("bad", []))
+    wheels = [w for w in glob.glob(os.path.join(ENGINE_DIR, f"{pkg}-*-py3-none-any.whl"))
+              if os.path.basename(w) not in bad]
     return max(wheels, key=lambda p: _vkey(_wheel_version(p)), default=None)
 
 
@@ -71,12 +92,70 @@ def _dist_version(dist):
         return "0"
 
 
+class _WheelFinder:
+    """Import hook that serves whole packages from downloaded wheels.
+
+    A plain sys.path entry isn't enough in the packaged app: PyInstaller's importer sits in front of
+    sys.path and would keep handing out the bundled (older) yt-dlp. This finder goes first and answers
+    for every module of the updated packages, so old and new code are never mixed."""
+
+    def __init__(self, roots):
+        self.roots = roots      # top-level package name -> wheel path
+
+    def find_spec(self, name, path=None, target=None):
+        import importlib.machinery
+        top = name.partition(".")[0]
+        whl = self.roots.get(top)
+        if not whl:
+            return None
+        search = [whl] if "." not in name else path
+        return importlib.machinery.PathFinder.find_spec(name, search)
+
+    def invalidate_caches(self):
+        pass
+
+
+ACTIVE_WHEELS = {}
+
+
 def activate_engine_updates():
-    """Call before yt_dlp is imported: prefer a newer yt-dlp downloaded by the in-app updater."""
+    """Call before yt_dlp is imported: use a newer yt-dlp downloaded by the updater, if there is one."""
+    roots = {}
     for pkg, dist in (("yt_dlp", "yt-dlp"), ("yt_dlp_ejs", "yt-dlp-ejs")):
         whl = _latest_wheel(pkg)
-        if whl and _vkey(_wheel_version(whl)) > _vkey(_dist_version(dist)):
-            sys.path.insert(0, whl)
+        if whl and _vkey(_wheel_version(whl)) > _vkey(_bundled_version(pkg, dist)):
+            roots[pkg] = whl
+    if roots and "yt_dlp" not in sys.modules:
+        sys.meta_path.insert(0, _WheelFinder(roots))
+        sys.path.insert(0, roots.get("yt_dlp", next(iter(roots.values()))))
+        ACTIVE_WHEELS.update(roots)
+
+
+def _bundled_version(pkg, dist):
+    """Version shipped with the app (read without importing the package)."""
+    v = _dist_version(dist)
+    if v != "0":
+        return v
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec(f"{pkg}.version")
+        if spec and spec.loader:
+            src = spec.loader.get_source(f"{pkg}.version") or ""
+            m = re.search(r"__version__\s*=\s*['\"]([^'\"]+)", src)
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
+    return "0"
+
+
+def newest_good_engine():
+    """Version of the newest usable engine on disk (downloaded or bundled)."""
+    whl = _latest_wheel("yt_dlp")
+    bundled = _bundled_version("yt_dlp", "yt-dlp")
+    if whl and _vkey(_wheel_version(whl)) > _vkey(bundled):
+        return _wheel_version(whl)
+    return bundled
 
 
 _yt = None
@@ -204,6 +283,17 @@ def friendly_error(text):
     return "Something went wrong. Please try again."
 
 
+BREAKAGE_SIGNS = ("unable to extract", "signature extraction failed", "nsig extraction failed",
+                  "failed to extract any player response", "requested format is not available",
+                  "http error 403", "precondition check failed", "please report this issue",
+                  "unable to download api page", "no video formats found", "challenge solving failed")
+
+
+def looks_like_engine_breakage(raw):
+    t = (raw or "").lower()
+    return any(k in t for k in BREAKAGE_SIGNS)
+
+
 def kill_child_tools():
     """Stop FFmpeg / Deno processes started by this app (used when cancelling)."""
     if os.name != "nt":
@@ -287,11 +377,13 @@ class FetchJob(QObject):
         self._aborted = True
 
     def _run(self):
+        self.raw = ""
         try:
             info = fetch_info(self.url, self.playlist, self.cookies)
             if not self._aborted:
                 self.done.emit(info)
         except Exception as e:
+            self.raw = str(e)
             if not self._aborted:
                 self.failed.emit(friendly_error(str(e)))
 
@@ -323,6 +415,8 @@ def build_download_args(spec):
         tmpl = prefix + tmpl
     else:
         a.append("--no-playlist")
+    if spec.get("name_prefix"):
+        tmpl = spec["name_prefix"].replace("%", "%%") + tmpl
     if spec.get("name_suffix"):
         tmpl = tmpl.replace(".%(ext)s", spec["name_suffix"].replace("%", "%%") + ".%(ext)s")
     if spec.get("overwrite"):
@@ -391,6 +485,8 @@ def predict_path(spec, info):
         return None
     try:
         tmpl = TEMPLATES.get(spec.get("template"), TEMPLATES["title"])
+        if spec.get("name_prefix"):
+            tmpl = spec["name_prefix"].replace("%", "%%") + tmpl
         if spec.get("name_suffix"):
             tmpl = tmpl.replace(".%(ext)s", spec["name_suffix"].replace("%", "%%") + ".%(ext)s")
         y = ytdlp()
@@ -412,7 +508,8 @@ def build_opts(spec):
 
 class DownloadJob(QObject):
     progress = Signal(float, str, str)   # percent (or -1 = busy), headline, detail
-    done = Signal(bool, str, list)        # ok, message, files
+    done = Signal(bool, str, list)        # ok, message, files   (message "__cancelled__" / "__paused__")
+    meta = Signal(dict)                   # title / id of the video being downloaded
 
     def __init__(self, url, spec, expected_streams=1, info=None, parent=None):
         super().__init__(parent)
@@ -422,6 +519,9 @@ class DownloadJob(QObject):
         self.expected = max(1, expected_streams)
         self.info = info if (info and not self.playlist and time.time() - info.get("_sg_time", 0) < INFO_MAX_AGE) else None
         self.cancelled = False
+        self.keep_partial = False      # pause: stop but leave partial files so the download can resume
+        self.raw_error = ""
+        self._meta_sent = None
         self.files, self.seen = [], []
         self._before = {}      # folder -> file names that existed before this job wrote there
         self.cur_item, self.n_items = 1, 0
@@ -441,12 +541,23 @@ class DownloadJob(QObject):
         self.progress.emit(-1, "Preparing download", "Starting…")
         threading.Thread(target=self._run, daemon=True, name="sg-download").start()
 
-    def cancel(self):
+    def cancel(self, keep_partial=False):
         if self.cancelled:
             return
+        self.keep_partial = keep_partial
         self.cancelled = True
-        self.progress.emit(-1, "Cancelling", "Stopping download and cleaning up…")
+        if keep_partial:
+            self.progress.emit(-1, "Pausing", "Stopping, partial files are kept…")
+        else:
+            self.progress.emit(-1, "Cancelling", "Stopping download and cleaning up…")
         threading.Thread(target=kill_child_tools, daemon=True).start()
+
+    def partial_files(self):
+        """Files this job has started (for cleaning up a paused download that gets cancelled later)."""
+        out = []
+        for key in self.seen:
+            out += [key, key + ".part", key + ".ytdl"]
+        return out
 
     # ---- worker thread
     def _run(self):
@@ -475,7 +586,11 @@ class DownloadJob(QObject):
                         f"{friendly_error(skipped[-1])}")
             self.done.emit(True, note, self.files)
         except Exception as e:
-            if self.cancelled or isinstance(e, y.utils.DownloadCancelled):
+            self.raw_error = str(e)
+            if self.cancelled and self.keep_partial:
+                time.sleep(0.5)
+                self.done.emit(False, "__paused__", self.partial_files())
+            elif self.cancelled or isinstance(e, y.utils.DownloadCancelled):
                 time.sleep(0.5)
                 self._cleanup()
                 self.done.emit(False, "__cancelled__", list(getattr(self, "left_over", [])))
@@ -505,6 +620,13 @@ class DownloadJob(QObject):
                 info["formats"] = [dict(f) for f in self.info.get("formats") or []]
                 for k in ("requested_formats", "requested_downloads", "_sg_fast", "_sg_time"):
                     info.pop(k, None)
+                # Cover art: yt-dlp also lists thumbnail addresses it only guesses (maxresdefault etc.) and tries
+                # them best-first, waiting for each one that doesn't exist (~0.5-1 s each, 4+ s for many
+                # videos). The one YouTube itself named as the video's thumbnail exists, so use just that.
+                best = info.get("thumbnail")
+                named = [dict(t) for t in info.get("thumbnails") or [] if t.get("url") == best]
+                if named:
+                    info["thumbnails"] = named
                 ydl.process_ie_result(info, download=True)
                 code = 1 if log.errors else 0
             else:
@@ -526,6 +648,10 @@ class DownloadJob(QObject):
             return
         self._last_emit = now
         info = d.get("info_dict") or {}
+        if info.get("id") and info.get("id") != self._meta_sent:
+            self._meta_sent = info.get("id")
+            self.meta.emit({"id": info.get("id"), "title": info.get("title"), "duration": info.get("duration"),
+                            "playlist_index": info.get("playlist_index")})
         down, total = d.get("downloaded_bytes"), d.get("total_bytes") or d.get("total_bytes_estimate")
         spd, eta = d.get("speed"), d.get("eta")
         pidx = int(info.get("playlist_index") or 1)
@@ -644,52 +770,172 @@ class DownloadJob(QObject):
 
 
 # --------------------------------------------------------------------------- updates
+def run_engine_selftest(expect_version, timeout=90):
+    """Start a separate StreamGrab process that loads the newest engine and checks it works.
+    Returns (ok, detail)."""
+    import tempfile
+    from .utils import app_command, app_env, NO_WINDOW
+    out = os.path.join(tempfile.gettempdir(), f"sg_selftest_{os.getpid()}_{int(time.time())}.json")
+    try:
+        p = subprocess.run(app_command() + ["--engine-selftest", out], env=app_env(), timeout=timeout,
+                           creationflags=NO_WINDOW, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with open(out, encoding="utf-8") as f:
+            res = json.load(f)
+    except Exception as e:
+        return False, f"self-test didn't run ({e})"
+    finally:
+        try:
+            os.remove(out)
+        except OSError:
+            pass
+    if not res.get("ok"):
+        return False, res.get("error", "self-test failed")
+    if expect_version and res.get("version") != expect_version:
+        return False, f"loaded {res.get('version')} instead of {expect_version}"
+    return True, res.get("version", "")
+
+
+def engine_selftest(out_path):
+    """Runs in the self-test process (after activate_engine_updates)."""
+    res = {"ok": False}
+    try:
+        y = ytdlp()
+        res["version"] = y.version.__version__
+        res["source"] = getattr(y, "__file__", "")
+        with y.YoutubeDL(dict(base_opts(), skip_download=True)) as ydl:
+            ie = ydl.get_info_extractor("Youtube")
+            assert ie is not None
+            assert ie.suitable("https://www.youtube.com/watch?v=jNQXAC9IVRw")
+        build_opts(dict(mode="av", outdir=".", container="mp4", codec="h264", res=720))
+        try:
+            import yt_dlp_ejs  # noqa  (JavaScript challenge solver)
+            res["ejs"] = getattr(yt_dlp_ejs, "__version__", "?")
+        except Exception as e:
+            res["ejs_error"] = str(e)
+        res["ok"] = True
+    except Exception as e:
+        res["error"] = f"{type(e).__name__}: {e}"
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(res, f)
+    return 0 if res["ok"] else 1
+
+
 class EngineUpdater(QObject):
-    """Downloads the newest yt-dlp (+ its JS solver) from PyPI. Takes effect after a restart."""
-    finished = Signal(bool, str)
+    """Downloads the newest yt-dlp (+ its JS solver) from PyPI, self-tests it in a separate process and
+    keeps the previous version for rollback. New downloads (worker processes) use it straight away;
+    link loading in the window uses it after a restart."""
+    finished = Signal(bool, str, list)   # ok, message, installed ["yt-dlp 2026.11.20", ...]
+
+    def __init__(self, parent=None, silent=False):
+        super().__init__(parent)
+        self.silent = silent
 
     def start(self):
         threading.Thread(target=self._run, daemon=True, name="sg-update").start()
 
     def _run(self):
         import urllib.request
+        st = engine_state()
         try:
-            current = {"yt-dlp": engine_version(), "yt-dlp-ejs": _dist_version("yt-dlp-ejs")}
-            try:
-                import yt_dlp_ejs
-                current["yt-dlp-ejs"] = getattr(yt_dlp_ejs, "__version__", current["yt-dlp-ejs"])
-            except Exception:
-                pass
             os.makedirs(ENGINE_DIR, exist_ok=True)
-            updated = []
+            installed = []
             for dist, pkg in (("yt-dlp", "yt_dlp"), ("yt-dlp-ejs", "yt_dlp_ejs")):
-                with urllib.request.urlopen(f"https://pypi.org/pypi/{dist}/json", timeout=20) as r:
+                req = urllib.request.Request(f"https://pypi.org/pypi/{dist}/json",
+                                             headers={"User-Agent": "StreamGrab"})
+                with urllib.request.urlopen(req, timeout=20) as r:
                     data = json.load(r)
                 latest = data["info"]["version"]
                 have = _latest_wheel(pkg)
-                have_v = max(current[dist], _wheel_version(have) if have else "0", key=_vkey)
+                have_v = max(_bundled_version(pkg, dist), _wheel_version(have) if have else "0", key=_vkey)
                 if _vkey(latest) <= _vkey(have_v):
                     continue
                 wheel = next(u for u in data["urls"]
                              if u["packagetype"] == "bdist_wheel" and u["filename"].endswith("py3-none-any.whl"))
+                if wheel["filename"] in st.get("bad", []):
+                    continue          # this exact version failed its self-test before
                 dest = os.path.join(ENGINE_DIR, wheel["filename"])
-                with urllib.request.urlopen(wheel["url"], timeout=60) as r:
+                with urllib.request.urlopen(wheel["url"], timeout=120) as r:
                     blob = r.read()
                 if hashlib.sha256(blob).hexdigest() != wheel["digests"]["sha256"]:
                     raise RuntimeError("Download was corrupted, please try again.")
                 with open(dest + ".part", "wb") as f:
                     f.write(blob)
                 os.replace(dest + ".part", dest)
-                for old in glob.glob(os.path.join(ENGINE_DIR, f"{pkg}-*.whl")):
-                    if old != dest:
+                installed.append((dist, pkg, latest, dest))
+
+            msgs = []
+            if installed:
+                ok, detail = run_engine_selftest(next((v for d, _, v, _ in installed if d == "yt-dlp"), None))
+                st = engine_state()
+                if not ok:
+                    st.setdefault("bad", [])
+                    for _, _, _, dest in installed:
+                        name = os.path.basename(dest)
+                        if name not in st["bad"]:
+                            st["bad"].append(name)
                         try:
-                            os.remove(old)
+                            os.remove(dest)
                         except OSError:
                             pass
-                updated.append(f"{dist} {latest}")
-            if updated:
-                self.finished.emit(True, f"Downloaded {', '.join(updated)}. Restart StreamGrab to use it.")
+                    st["last_check"] = time.time()
+                    save_engine_state(st)
+                    raise RuntimeError(f"The new engine didn't pass its check ({detail}); "
+                                       "StreamGrab keeps using the current one.")
+                for _, pkg, _, dest in installed:
+                    _prune_old_wheels(pkg, keep=dest)
+                msgs = [f"{d} {v}" for d, _, v, _ in installed]
+            st = engine_state()
+            st["last_check"] = time.time()
+            st["last_result"] = "updated" if msgs else "current"
+            save_engine_state(st)
+            if msgs:
+                self.finished.emit(True, f"Downloaded {', '.join(msgs)}. New downloads use it now; "
+                                         "restart StreamGrab to use it for loading links too.", msgs)
             else:
-                self.finished.emit(True, f"You're up to date (yt-dlp {current['yt-dlp']}).")
+                self.finished.emit(True, f"You're up to date (yt-dlp {newest_good_engine()}).", [])
         except Exception as e:
-            self.finished.emit(False, f"Update failed: {friendly_error(str(e))}")
+            try:
+                st = engine_state()
+                st["last_check"] = time.time()
+                st["last_result"] = "error"
+                save_engine_state(st)
+            except OSError:
+                pass
+            self.finished.emit(False, f"Update failed: {friendly_error(str(e))}", [])
+
+
+def _prune_old_wheels(pkg, keep):
+    """Keep the new wheel and the one before it (for rollback); remove older ones."""
+    wheels = sorted(glob.glob(os.path.join(ENGINE_DIR, f"{pkg}-*-py3-none-any.whl")),
+                    key=lambda p: _vkey(_wheel_version(p)), reverse=True)
+    for old in wheels[2:]:
+        if old != keep:
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+
+
+GITHUB_REPO = "Wafic2004/StreamGrab"
+
+
+class AppUpdateChecker(QObject):
+    """Looks at the latest GitHub release of StreamGrab."""
+    found = Signal(str, str)     # version, release page url
+
+    def start(self):
+        threading.Thread(target=self._run, daemon=True, name="sg-appupdate").start()
+
+    def _run(self):
+        import urllib.request
+        from . import APP_VERSION
+        try:
+            req = urllib.request.Request(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+                                         headers={"User-Agent": "StreamGrab", "Accept": "application/vnd.github+json"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = json.load(r)
+            tag = (data.get("tag_name") or "").lstrip("vV")
+            if tag and _vkey(tag) > _vkey(APP_VERSION) and not data.get("draft") and not data.get("prerelease"):
+                self.found.emit(tag, data.get("html_url") or f"https://github.com/{GITHUB_REPO}/releases/latest")
+        except Exception:
+            pass

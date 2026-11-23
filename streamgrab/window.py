@@ -2,21 +2,29 @@ import os
 import time
 import ctypes
 
-from PySide6.QtCore import Qt, QSettings, QUrl, QTimer, QSize, QRectF, QPointF
-from PySide6.QtGui import QPixmap, QPainter, QPainterPath, QColor, QDesktopServices, QGuiApplication, QStandardItemModel
+from PySide6.QtCore import Qt, QUrl, QTimer, QSize, QRectF, QPointF, QEvent
+from PySide6.QtGui import (QPixmap, QPainter, QPainterPath, QColor, QDesktopServices, QGuiApplication,
+                           QStandardItemModel, QKeySequence, QShortcut)
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QLineEdit,
                                QPushButton, QFrame, QComboBox, QListView, QCheckBox, QProgressBar, QStackedWidget,
-                               QButtonGroup, QFileDialog, QScrollArea, QApplication, QSizePolicy, QMessageBox)
+                               QButtonGroup, QFileDialog, QScrollArea, QApplication, QSizePolicy, QMessageBox,
+                               QSystemTrayIcon)
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
 
-from . import APP_NAME
+from . import APP_NAME, APP_VERSION
 from . import icons as I
-from .engine import FetchJob, DownloadJob, predict_path
+from .engine import (FetchJob, predict_path, EngineUpdater, AppUpdateChecker, engine_version, engine_state,
+                     newest_good_engine, looks_like_engine_breakage, _vkey)
 from .formats import Analysis
+from .downloads import QueueManager
+from .queue_view import QueuePage
+from .batch_dialog import BatchDialog
 from .settings_dialog import SettingsDialog
 from .theme import build_stylesheet, palette
 from .utils import (find_tool, default_download_dir, fmt_bytes, fmt_duration, fmt_count, fmt_date,
-                    normalize_url, check_link, is_media_link, playlist_kind, reveal_in_explorer)
+                    normalize_url, check_link, is_media_link, playlist_kind, reveal_in_explorer,
+                    settings as app_settings, split_links, safe_folder_name, app_command, app_env,
+                    portable_state, NO_WINDOW)
 
 AV_CONTAINERS = [("MP4   ·   plays everywhere", "mp4"), ("MKV   ·   most flexible", "mkv"), ("WebM", "webm"),
                  ("MOV   ·   Apple & editing", "mov"), ("AVI   ·   legacy, re-encodes", "avi")]
@@ -152,7 +160,14 @@ class Thumb(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.s = QSettings(APP_NAME, APP_NAME)
+        self.s = app_settings()
+        self.queue = QueueManager(self.s, self)
+        self.current_id = None          # queue item shown in the Download tab's status area
+        self._pl_fetchers = []
+        self._updater = None
+        self._last_repair = 0.0
+        self._restarting = False
+        self._tray = None
         self.info = None
         self.analysis = None
         self.url = ""
@@ -172,6 +187,23 @@ class MainWindow(QMainWindow):
         self.resize(min(900, scr.width() - 60), min(940, scr.height() - 40))
         self.setAcceptDrops(True)
 
+        central = QWidget()
+        central.setObjectName("root")
+        self.setCentralWidget(central)
+        outer = QVBoxLayout(central)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        top = QWidget()
+        tl = QVBoxLayout(top)
+        tl.setContentsMargins(26, 18, 26, 8)
+        tl.setSpacing(10)
+        tl.addLayout(self._build_header())
+        tl.addWidget(self._build_banner())
+        outer.addWidget(top)
+
+        self.page_stack = QStackedWidget()
+        outer.addWidget(self.page_stack, 1)
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -179,13 +211,14 @@ class MainWindow(QMainWindow):
         root = QWidget()
         root.setObjectName("root")
         scroll.setWidget(root)
-        self.setCentralWidget(scroll)
         scroll.viewport().setObjectName("root")
+        self.page_stack.addWidget(scroll)
+        self.queue_page = QueuePage(self.queue)
+        self.page_stack.addWidget(self.queue_page)
 
         lay = QVBoxLayout(root)
-        lay.setContentsMargins(26, 20, 26, 24)
+        lay.setContentsMargins(26, 6, 26, 24)
         lay.setSpacing(14)
-        lay.addLayout(self._build_header())
         lay.addWidget(self._build_url_card())
         lay.addWidget(self._build_info_card())
         lay.addWidget(self._build_options_card())
@@ -204,6 +237,31 @@ class MainWindow(QMainWindow):
         if hasattr(sh, "colorSchemeChanged"):
             sh.colorSchemeChanged.connect(lambda *_: self.s.value("theme", "dark") == "system" and self.apply_theme())
 
+        # queue
+        self.queue.item_changed.connect(self._queue_item_changed)
+        self.queue.summary_changed.connect(self._queue_summary)
+        self.queue.queue_finished.connect(self._queue_done_notify)
+        self.queue.item_finished.connect(self._queue_item_finished)
+        self.url_edit.installEventFilter(self)
+        QShortcut(QKeySequence("Ctrl+1"), self, activated=lambda: self.show_page(0))
+        QShortcut(QKeySequence("Ctrl+2"), self, activated=lambda: self.show_page(1))
+        unfinished = self.queue.load()
+        if self.s.value("resume_after_restart", False, type=bool):
+            self.s.setValue("resume_after_restart", False)
+            if unfinished:
+                self.queue.resume_all()
+        elif unfinished:
+            self.show_banner(f"{unfinished} download{'s' if unfinished > 1 else ''} didn't finish last time. "
+                             "They continue where they stopped.", "Resume", self._resume_from_banner)
+            self._banner_kind = "restore"
+        if portable_state() == "readonly" and not self.banner.isVisibleTo(self):
+            # (the Settings footer also says so; a "downloads didn't finish" notice is more useful)
+            self.show_banner("This folder is read-only, so portable mode is off: settings are saved on this PC "
+                             "instead of next to StreamGrab.exe.")
+        self._queue_summary()
+        QTimer.singleShot(8000, self._auto_engine_check)
+        QTimer.singleShot(15000, self._check_app_update)
+
     # ================================================================== UI
     def _build_header(self):
         h = QHBoxLayout()
@@ -217,6 +275,27 @@ class MainWindow(QMainWindow):
         col.addWidget(label("Download YouTube videos and audio in any quality", "appTag"))
         h.addLayout(col)
         h.addStretch(1)
+        tabs = QFrame()
+        tabs.setObjectName("segment")
+        tsl = QHBoxLayout(tabs)
+        tsl.setContentsMargins(3, 3, 3, 3)
+        tsl.setSpacing(3)
+        self.tab_group = QButtonGroup(self)
+        self.tab_buttons = []
+        for i, text in enumerate(("  Download", "  Queue")):
+            b = QPushButton(text)
+            b.setObjectName("tab")
+            b.setCheckable(True)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.tab_group.addButton(b, i)
+            tsl.addWidget(b)
+            self.tab_buttons.append(b)
+        self.tab_buttons[0].setChecked(True)
+        self.tab_buttons[0].setToolTip("New download (Ctrl+1)")
+        self.tab_buttons[1].setToolTip("All downloads (Ctrl+2)")
+        self.tab_group.idClicked.connect(self.show_page)
+        h.addWidget(tabs)
+        h.addSpacing(8)
         self.theme_btn = QPushButton()
         self.theme_btn.setObjectName("ghost")
         self.theme_btn.setToolTip("Switch light / dark theme")
@@ -227,6 +306,33 @@ class MainWindow(QMainWindow):
         h.addWidget(self.theme_btn)
         h.addWidget(self.settings_btn)
         return h
+
+    def _build_banner(self):
+        b = QFrame()
+        b.setObjectName("banner")
+        h = QHBoxLayout(b)
+        h.setContentsMargins(14, 8, 8, 8)
+        h.setSpacing(10)
+        self.banner_icon = QLabel()
+        self.banner_text = label("", "bannerText", wrap=True)
+        self.banner_btn = QPushButton()
+        self.banner_btn.setObjectName("primary")
+        self.banner_btn.clicked.connect(self._banner_action)
+        self.banner_close = QPushButton()
+        self.banner_close.setObjectName("icon")
+        self.banner_close.setFixedSize(30, 30)
+        self.banner_close.setToolTip("Dismiss")
+        self.banner_close.setAccessibleName("Dismiss")
+        self.banner_close.clicked.connect(self.hide_banner)
+        h.addWidget(self.banner_icon, 0, Qt.AlignmentFlag.AlignTop)
+        h.addWidget(self.banner_text, 1)
+        h.addWidget(self.banner_btn)
+        h.addWidget(self.banner_close)
+        b.setVisible(False)
+        self.banner = b
+        self._banner_cb = None
+        self._banner_dismiss = None
+        return b
 
     def _build_url_card(self):
         c = card()
@@ -505,6 +611,7 @@ class MainWindow(QMainWindow):
             self.av_res: "Resolution", self.av_cont: "Format", self.av_codec: "Video codec", self.av_audio: "Audio quality",
             self.v_res: "Resolution", self.v_cont: "Format", self.v_codec: "Video codec",
             self.a_fmt: "Audio format", self.a_q: "Audio quality",
+            self.tab_buttons[0]: "Download tab", self.tab_buttons[1]: "Queue tab",
         }
         for w, n in names.items():
             w.setAccessibleName(n)
@@ -561,6 +668,11 @@ class MainWindow(QMainWindow):
         self.show_btn.setIcon(I.glyph_icon(I.G_BROWSE, t, 14))
         for b, g in zip(self.seg_buttons, (I.G_VIDEO, I.G_MUTE, I.G_AUDIO)):
             b.setIcon(I.glyph_icon(g, m, 16, on_color=w))
+        for b, g in zip(self.tab_buttons, (I.G_DOWNLOAD, I.G_LIST)):
+            b.setIcon(I.glyph_icon(g, m, 15, on_color=w))
+        self.banner_icon.setPixmap(I.glyph_pixmap(I.G_INFO, p["accent"], 18))
+        self.banner_close.setIcon(I.glyph_icon(I.G_CANCEL, m, 12))
+        self.queue_page.apply_theme(p)
         self.empty_icon.setPixmap(I.glyph_pixmap(I.G_LINK, p["accent"], 34))
         self.thumb.placeholder = p["surface2"]
         self.thumb.update()
@@ -609,13 +721,21 @@ class MainWindow(QMainWindow):
         s.setValue("a_embed", self.a_embed.isChecked())
 
     def closeEvent(self, e):
-        if self.job and self.busy:
-            r = QMessageBox.question(self, APP_NAME, "A download is still running. Cancel it and quit?")
+        c = self.queue.counts()
+        working = c["running"] + (0 if self.queue.paused_all else c["waiting"])
+        if working and not self._restarting:
+            n = working
+            r = QMessageBox.question(
+                self, APP_NAME,
+                f"{n} download{'s are' if n > 1 else ' is'} still in progress.\n\n"
+                "Quit anyway? They pause now and continue where they stopped next time you open StreamGrab.")
             if r != QMessageBox.StandardButton.Yes:
                 e.ignore()
                 return
-            self.job.cancel()
+        self.queue.shutdown()
         self._save_prefs()
+        if self._tray:
+            self._tray.hide()
         super().closeEvent(e)
 
     def _check_tools(self):
@@ -633,6 +753,9 @@ class MainWindow(QMainWindow):
     def paste_and_fetch(self):
         text = QGuiApplication.clipboard().text().strip()
         self._last_clip = text
+        if len(split_links(text)) > 1:
+            self.add_many(split_links(text))
+            return
         if text:
             self.url_edit.setText(text)
             self.fetch(force=True)
@@ -655,8 +778,6 @@ class MainWindow(QMainWindow):
             self.fetch()
 
     def fetch(self, force=False):
-        if self.busy:
-            return
         url, err = check_link(self.url_edit.text())
         if err:
             self._link_error(*err)
@@ -698,8 +819,11 @@ class MainWindow(QMainWindow):
         self.fetch_btn.setText("  Fetch")
 
     def _fetch_failed(self, msg):
+        raw = getattr(self.fetcher, "raw", "") if self.fetcher else ""
         self._end_fetch()
         self._show_empty_error("Couldn't load this link", msg)
+        if looks_like_engine_breakage(raw):
+            self._engine_repair("fetch")
 
     def _show_empty_error(self, title, text):
         self.info_stack.setCurrentIndex(0)
@@ -910,12 +1034,7 @@ class MainWindow(QMainWindow):
 
     # ================================================================== download
     def _set_busy(self, busy):
-        self.busy = busy
-        for w in (self.url_edit, self.paste_btn, self.fetch_btn, self.path_edit, self.browse_btn, self.playlist_chk):
-            w.setEnabled(not busy)
-        self.options_card.setEnabled(not busy)
-        self.download_btn.setVisible(not busy)
-        self.download_btn.setEnabled(not busy and self.analysis is not None and not self.missing_tools)
+        """busy = the download shown here is still running (the form stays usable to queue more)."""
         self.cancel_btn.setVisible(busy)
         self.cancel_btn.setEnabled(True)
         if busy:
@@ -928,7 +1047,15 @@ class MainWindow(QMainWindow):
                          f"Couldn't find {' and '.join(self.missing_tools)}, which downloads need. Put ffmpeg.exe and "
                          "ffprobe.exe in the 'bin' folder next to StreamGrab.exe, then restart the app.", "error")
         else:
-            self._status("Ready", "Pick your options, then press Download.", None)
+            c = self.queue.counts()
+            if c["running"] or c["waiting"]:
+                n = c["running"] + c["waiting"]
+                self._status("Ready", f"{n} download{'s' if n > 1 else ''} in the queue. Pick options for this one, "
+                                      "then press Add to queue.", None)
+            else:
+                self._status("Ready", "Pick your options, then press Download.", None)
+        self.current_id = None
+        self.cancel_btn.setVisible(False)
         self.progress.setRange(0, 1000)
         self.progress.setValue(0)
         self.pct_lbl.setText("")
@@ -962,7 +1089,10 @@ class MainWindow(QMainWindow):
             return
         self._save_prefs()
         spec = self.current_spec()
-        target = predict_path(spec, self.info)
+        policy = self.s.value("exists", "ask")
+        if policy != "ask":
+            spec["exists"] = policy
+        target = None if policy != "ask" or spec.get("playlist") else predict_path(spec, self.info)
         if target and os.path.exists(target):
             box = QMessageBox(self)
             box.setIcon(QMessageBox.Icon.Question)
@@ -987,66 +1117,338 @@ class MainWindow(QMainWindow):
                     n += 1
             else:
                 return
-        streams = (self.est or {}).get("streams", 2 if spec["mode"] == "av" else 1)
-        self.last_files = []
-        self.job = DownloadJob(self.url, spec, streams, info=self.info, parent=self)
-        self.job.progress.connect(self._on_progress)
-        self.job.done.connect(self._on_done)
-        self._set_busy(True)
-        self.progress.setRange(0, 1000)
-        self.progress.setValue(0)
-        self.job.start()
+        if spec.get("playlist"):
+            self._queue_playlist(spec)
+            return
+        if "exists" not in spec:
+            spec["exists"] = "keep"
+        info = self.info
+        est = self.est or {}
+        iid = self.queue.add(self.url, spec, title=info.get("title"), thumb=self._thumb_url(info), info=info,
+                             duration=info.get("duration"), size=est.get("size"), desc=est.get("desc"))
+        self._track(iid)
 
     def cancel(self):
-        if self.job:
+        if self.current_id:
             self.cancel_btn.setEnabled(False)
-            self.job.cancel()
+            self.queue.cancel(self.current_id)
 
-    def _on_progress(self, pct, head, detail):
-        if pct < 0:
-            self.progress.setRange(0, 0)
+    # ================================================================== queue <-> Download tab
+    def _track(self, iid):
+        """Show this queue item's progress in the Download tab's status area."""
+        self.current_id = iid
+        self.last_files = []
+        self._queue_item_changed(iid)
+
+    def _queue_item_changed(self, iid):
+        if iid != self.current_id:
+            return
+        it = self.queue.item(iid)
+        if not it:
+            return
+        st = it["status"]
+        if st == "waiting":
+            self._set_busy(True)
+            self.progress.setRange(0, 1000)
+            self.progress.setValue(0)
             self.pct_lbl.setText("")
+            n = self.queue.parallel
+            self._status("Waiting in the queue", f"Starts as soon as a download finishes ({n} run at a time). "
+                                                 "See the Queue tab for all downloads.", None)
+        elif st in ("starting", "downloading"):
+            self._set_busy(True)
+            pct = it.get("pct", -1)
+            if pct is None or pct < 0:
+                self.progress.setRange(0, 0)
+                self.pct_lbl.setText("")
+            else:
+                if self.progress.maximum() == 0:
+                    self.progress.setRange(0, 1000)
+                self.progress.setValue(int(pct * 10))
+                self.pct_lbl.setText(f"{int(pct)}%")
+            self._status(it.get("head", ""), it.get("detail", ""), None)
+        elif st == "paused":
+            self._set_busy(True)
+            self.progress.setRange(0, 1000)
+            self._status("Paused", "Partial files are kept. Resume it from the Queue tab.", None)
         else:
-            if self.progress.maximum() == 0:
-                self.progress.setRange(0, 1000)
-            self.progress.setValue(int(pct * 10))
-            self.pct_lbl.setText(f"{int(pct)}%")
-        self._status(head, detail, None)
-
-    def _on_done(self, ok, msg, files):
-        self._set_busy(False)
-        self.progress.setRange(0, 1000)
-        job, self.job = self.job, None
-        if job:
-            job.deleteLater()
-        if ok:
-            self.progress.setValue(1000)
-            self.pct_lbl.setText("100%")
+            self._set_busy(False)
+            self.progress.setRange(0, 1000)
+            files = [f for f in it.get("files") or [] if f]
             self.last_files = [f for f in files if os.path.exists(f)] or files
-            if len(self.last_files) > 1:
-                detail = f"{len(self.last_files)} files saved to {self.path_edit.text()}"
-            elif self.last_files:
-                detail = os.path.basename(self.last_files[-1])
+            if st == "done":
+                self.progress.setValue(1000)
+                self.pct_lbl.setText("100%")
+                self._status("Download complete", it.get("detail", ""), "ok")
+                QApplication.alert(self)
+            elif st == "skipped":
+                self.progress.setValue(1000)
+                self.pct_lbl.setText("")
+                self._status("Already downloaded", "The file is already in the folder, so it was skipped.", "ok")
+            elif st == "cancelled":
+                self.progress.setValue(0)
+                self.pct_lbl.setText("")
+                self._status("Download cancelled", it.get("detail", ""),
+                             "error" if "couldn't" in it.get("detail", "") else None)
             else:
-                detail = "The file was already downloaded."
-            if msg:
-                detail += f"\n{msg}"
-            self._status("Download complete", detail, "ok")
-            self.play_btn.setVisible(len(self.last_files) == 1)
-            self.show_btn.setVisible(bool(self.last_files))
-            QApplication.alert(self)
-        elif msg == "__cancelled__":
-            self.progress.setValue(0)
-            self.pct_lbl.setText("")
-            if files:
-                self._status("Download cancelled", "Some partial files couldn't be removed:\n"
-                             + "\n".join(os.path.basename(f) for f in files[:3]), "error")
+                self.progress.setValue(0)
+                self.pct_lbl.setText("")
+                self._status("Download failed", it.get("detail", ""), "error")
+            self.play_btn.setVisible(st in ("done", "skipped") and len(self.last_files) == 1)
+            self.show_btn.setVisible(st in ("done", "skipped") and bool(self.last_files))
+
+    def _queue_summary(self):
+        c = self.queue.counts()
+        n = c["active"]
+        self.tab_buttons[1].setText(f"  Queue  {n}" if n else "  Queue")
+        busy = c["running"] > 0 or c["waiting"] > 0
+        self.download_btn.setText("  Add to queue" if busy else "  Download")
+        self.download_btn.setToolTip("Starts when a download slot is free" if busy else "")
+
+    def _queue_item_finished(self, iid, ok):
+        it = self.queue.item(iid)
+        if it and not ok and looks_like_engine_breakage(it.get("raw", "")):
+            self._engine_repair("download")
+
+    def _queue_done_notify(self, done, failed):
+        if self.isActiveWindow():
+            return
+        QApplication.alert(self)
+        text = f"{done} download{'s' if done != 1 else ''} finished"
+        if failed:
+            text += f", {failed} failed"
+        try:
+            if self._tray is None and QSystemTrayIcon.isSystemTrayAvailable():
+                self._tray = QSystemTrayIcon(I.app_icon(), self)
+                self._tray.messageClicked.connect(lambda: (self.showNormal(), self.activateWindow(), self.show_page(1)))
+            if self._tray:
+                self._tray.show()
+                self._tray.showMessage(APP_NAME, text + ".", QSystemTrayIcon.MessageIcon.Information, 6000)
+                QTimer.singleShot(9000, lambda: self._tray and self._tray.hide())
+        except Exception:
+            pass
+
+    def show_page(self, i):
+        self.page_stack.setCurrentIndex(i)
+        self.tab_buttons[i].setChecked(True)
+        if i == 1 and getattr(self, "_banner_kind", None) == "restore":
+            self.banner.setVisible(False)   # the Queue tab has its own Resume buttons
+
+    # ---- playlists: one queue item per video
+    def _queue_playlist(self, spec):
+        if self.info and self.info.get("_type") == "playlist":
+            self._expand_playlist(self.info, spec, spec.get("playlist_folder", True))
+            return
+        self._status("Reading the playlist", "Getting the list of videos…", None)
+        self._fetch_playlist(self.url, spec, spec.get("playlist_folder", True))
+
+    def _fetch_playlist(self, url, spec, folder):
+        f = FetchJob(url, True, self.s.value("cookies", "none"), self)
+        self._pl_fetchers.append(f)
+
+        def ok(info):
+            self._pl_fetchers.remove(f)
+            f.deleteLater()
+            self._expand_playlist(info, spec, folder)
+
+        def bad(msg):
+            self._pl_fetchers.remove(f)
+            f.deleteLater()
+            self.show_banner(f"Couldn't read the playlist {url}: {msg}")
+        f.done.connect(ok)
+        f.failed.connect(bad)
+        f.start()
+
+    def _expand_playlist(self, info, spec, folder):
+        entries = [e for e in (info.get("entries") or []) if e and (e.get("id") or e.get("url"))]
+        group = info.get("title") or "Playlist"
+        outdir = spec["outdir"]
+        if folder:
+            outdir = os.path.join(outdir, safe_folder_name(group))
+        exists = spec.get("exists", "keep")
+        added = 0
+        for n, e in enumerate(entries, 1):
+            url = e.get("url") or f"https://www.youtube.com/watch?v={e['id']}"
+            if not url.startswith("http"):
+                url = f"https://www.youtube.com/watch?v={e.get('id') or url}"
+            es = dict(spec, playlist=False, outdir=outdir, name_prefix=f"{n:03d} - ",
+                      exists="keep" if exists == "ask" else exists)
+            es.pop("playlist_folder", None)
+            thumb = f"https://i.ytimg.com/vi/{e['id']}/mqdefault.jpg" if e.get("id") else None
+            self.queue.add(url, es, title=e.get("title") or url, thumb=thumb, group=group,
+                           duration=e.get("duration"))
+            added += 1
+        self.current_id = None
+        self._set_busy(False)
+        self._status(f"Added {added} video{'s' if added != 1 else ''} to the queue",
+                     f"From “{group}”. Each video downloads on its own; see the Queue tab.", "ok")
+        self.show_page(1)
+
+    # ---- several links at once
+    def add_many(self, links):
+        outdir = self.path_edit.text().strip() or default_download_dir()
+        try:
+            os.makedirs(outdir, exist_ok=True)
+        except OSError:
+            self._status("Can't save here", "That folder isn't writable. Choose another location.", "error")
+            return
+        dlg = BatchDialog(links, self.s, self)
+        QTimer.singleShot(0, lambda: set_title_bar(dlg, self._is_dark(), self.pal["bg"]))
+        if dlg.exec() != BatchDialog.DialogCode.Accepted:
+            return
+        spec = dlg.spec(outdir)
+        n_videos = 0
+        for u in links:
+            if playlist_kind(u) == "playlist":
+                self._fetch_playlist(u, dict(spec), dlg.playlist_folder())
             else:
-                self._status("Download cancelled", "Partial files were removed.", None)
+                vid = None
+                try:
+                    from urllib.parse import urlparse, parse_qs
+                    pu = urlparse(u)
+                    vid = (parse_qs(pu.query).get("v") or [None])[0] or pu.path.rstrip("/").split("/")[-1]
+                except ValueError:
+                    pass
+                thumb = f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg" if vid and len(vid) == 11 else None
+                self.queue.add(u, dict(spec, playlist=False), title=u, thumb=thumb)
+                n_videos += 1
+        self.show_page(1)
+
+    def eventFilter(self, obj, e):
+        # Ctrl+V of several links into the link box -> add them all
+        if obj is self.url_edit and e.type() == QEvent.Type.KeyPress and e.matches(QKeySequence.StandardKey.Paste):
+            links = split_links(QGuiApplication.clipboard().text())
+            if len(links) > 1:
+                self._last_clip = QGuiApplication.clipboard().text().strip()
+                self.add_many(links)
+                return True
+        return super().eventFilter(obj, e)
+
+    # ================================================================== banner
+    def show_banner(self, text, action_text=None, action=None, on_dismiss=None):
+        self._banner_kind = None
+        self.banner_text.setText(text)
+        self.banner_btn.setVisible(bool(action_text))
+        self.banner_btn.setText(action_text or "")
+        self._banner_cb = action
+        self._banner_dismiss = on_dismiss
+        self.banner.setVisible(True)
+
+    def _restore_notice_up(self):
+        return self.banner.isVisible() and getattr(self, "_banner_kind", None) == "restore"
+
+    def hide_banner(self):
+        self.banner.setVisible(False)
+        cb, self._banner_dismiss = self._banner_dismiss, None
+        if cb:
+            cb()
+
+    def _banner_action(self):
+        cb = self._banner_cb
+        self.banner.setVisible(False)
+        self._banner_dismiss = None
+        if cb:
+            cb()
+
+    def _resume_from_banner(self):
+        self.queue.resume_all()
+        self.show_page(1)
+
+    # ================================================================== engine updates
+    def _auto_engine_check(self):
+        if not self.s.value("auto_engine", True, type=bool):
+            return
+        last = engine_state().get("last_check", 0)
+        if time.time() - last < 20 * 3600:
+            self._maybe_offer_restart()
+            return
+        self._run_updater("daily")
+
+    def _engine_repair(self, why):
+        """A failure that looks like YouTube changed something: check for a newer engine right away."""
+        if not self.s.value("auto_engine", True, type=bool) or self._updater is not None:
+            return
+        if time.time() - self._last_repair < 30 * 60:
+            return
+        self._last_repair = time.time()
+        self._run_updater(why)
+
+    def _run_updater(self, why):
+        if self._updater is not None:
+            return
+        self._updater = EngineUpdater(self, silent=True)
+        self._updater.finished.connect(lambda ok, msg, inst: self._engine_updated(why, ok, msg, inst))
+        self._updater.start()
+
+    def _engine_updated(self, why, ok, msg, installed):
+        self._updater.deleteLater()
+        self._updater = None
+        if ok and installed:
+            self.queue.refresh_standby()    # the waiting worker has the old engine loaded
+        if not ok or not installed:
+            if why == "download" and not ok:
+                return
+            return
+        ver = newest_good_engine()
+        if why == "download":
+            self.show_banner(f"YouTube changed something, so StreamGrab updated its download engine to {ver}. "
+                             "Failed downloads can be retried now.", "Retry failed", self._retry_failed)
+        elif why == "fetch":
+            self.show_banner(f"StreamGrab updated its download engine to {ver}. Restart to load this link "
+                             "with it (downloads in progress pause and continue).", "Restart now", self.restart_app)
         else:
-            self.progress.setValue(0)
-            self.pct_lbl.setText("")
-            self._status("Download failed", msg, "error")
+            self._maybe_offer_restart()
+
+    def _maybe_offer_restart(self):
+        if self._restore_notice_up():
+            return              # offered again next start; the new engine is already used for downloads
+        loaded, newest = engine_version(), newest_good_engine()
+        if loaded != "unavailable" and _vkey(newest) > _vkey(loaded):
+            self.show_banner(f"Download engine updated to {newest}. New downloads already use it; restart "
+                             "StreamGrab to use it for loading links too.", "Restart now", self.restart_app)
+
+    def _retry_failed(self):
+        for iid in self.queue.failed_ids():
+            self.queue.retry(iid)
+        if self.queue.paused_all:
+            self.queue.resume_all()
+        self.show_page(1)
+
+    def _check_app_update(self):
+        if not self.s.value("notify_app_updates", True, type=bool):
+            return
+        if time.time() - float(self.s.value("app_check_time", 0) or 0) < 20 * 3600:
+            return
+        self.s.setValue("app_check_time", time.time())
+        self._app_checker = AppUpdateChecker(self)
+        self._app_checker.found.connect(self._app_update_found)
+        self._app_checker.start()
+
+    def _app_update_found(self, version, url):
+        if self.s.value("app_update_dismissed", "") == version:
+            return
+        if self._restore_notice_up():
+            self.s.setValue("app_check_time", 0)     # ask again next start
+            return
+        self.show_banner(f"StreamGrab {version} is available. You have {APP_VERSION}.", "Download",
+                         lambda: QDesktopServices.openUrl(QUrl(url)),
+                         on_dismiss=lambda: self.s.setValue("app_update_dismissed", version))
+
+    def restart_app(self):
+        self._restarting = True
+        c = self.queue.counts()
+        self.s.setValue("resume_after_restart", bool(c["running"] or (c["waiting"] and not self.queue.paused_all)))
+        self.queue.shutdown()
+        self._save_prefs()
+        self.s.sync()
+        import subprocess
+        try:
+            subprocess.Popen(app_command(), env=app_env(), close_fds=True,
+                             creationflags=getattr(subprocess, "DETACHED_PROCESS", 0) | NO_WINDOW)
+        except OSError:
+            self._restarting = False
+            return
+        self.close()
 
     def play_file(self):
         if self.last_files:
@@ -1066,6 +1468,10 @@ class MainWindow(QMainWindow):
         dlg.changed.connect(lambda: set_title_bar(dlg, self._is_dark(), self.pal["bg"]))
         dlg.exec()
         self._options_changed()
+        self.queue._schedule()          # "downloads at the same time" may have changed
+        if dlg.installed:
+            self.queue.refresh_standby()
+            self._maybe_offer_restart()
 
     def dragEnterEvent(self, e):
         md = e.mimeData()
@@ -1074,8 +1480,11 @@ class MainWindow(QMainWindow):
 
     def dropEvent(self, e):
         md = e.mimeData()
-        text = md.urls()[0].toString() if md.hasUrls() else md.text()
-        if text and not self.busy:
+        text = "\n".join(u.toString() for u in md.urls()) if md.hasUrls() else md.text()
+        links = split_links(text)
+        if len(links) > 1:
+            self.add_many(links)
+        elif text:
             self.url_edit.setText(text.strip())
             self.fetch(force=True)
 

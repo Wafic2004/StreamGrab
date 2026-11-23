@@ -11,7 +11,7 @@ Test data: public Blender Foundation videos (Big Buck Bunny 4K60, Blender HQ pla
 |---|---|---|---|---|---|---|---|---|
 | 1 | 1.0.0 | 83 | 78 | 4 | 1 | 18 | 9 | 9 |
 | 2 | 1.0.1 | 101 | 94 | 0 | 7 | 0 | 7 | 0 |
-| 3 | 1.1.0 | 129 | **121** | **0** | 8 | 1 | 9 | **0** |
+| 3 | 1.1.0 | 130 | **122** | **0** | 8 | 0 | 9 | **0** |
 
 Cycle 3 added 29 cases for the three new features (download queue, engine updates, portable mode) and re-ran every
 existing case the changes touch: all download modes, progress, cancel, playlists, the existing-file prompt, settings,
@@ -68,7 +68,7 @@ error handling and performance. Cases the changes don't touch keep their 1.0.1 r
   `data\`; registry and AppData unchanged; folder moved and settings came along; deleting `portable.txt` switches back to
   normal mode. From a read-only folder it runs in normal mode with a notice.
 
-Not run yet: EU-09 (new-version notice) needs the 1.1.0 release to be published first.
+EU-09 (new-version notice) was run after v1.1.0 was published: a 1.0.1 build announced 1.1.0, and stayed quiet after the notice was closed.
 
 ## Earlier cycles
 

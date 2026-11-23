@@ -138,6 +138,30 @@ QScrollBar::add-line, QScrollBar::sub-line { height: 0; width: 0; }
 QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
 
 QMessageBox { background: $surface; }
+
+QPushButton#tab { background: transparent; border: 1px solid transparent; border-radius: 10px; padding: 7px 14px; color: $muted; font-weight: 600; }
+QPushButton#tab:hover { color: $text; }
+QPushButton#tab:checked { background: $accent; color: $accent_text; border-color: $accent; }
+QPushButton#tab:focus { border: 2px solid $accent; color: $text; }
+QPushButton#tab:checked:focus { border: 2px solid $text; color: $accent_text; }
+
+QFrame#banner { background: $accent_soft; border: 1px solid $accent; border-radius: 12px; }
+QLabel#bannerText { font-size: 9.5pt; }
+QFrame#banner QPushButton#primary { padding: 7px 14px; border-radius: 9px; }
+
+QPushButton#icon { background: transparent; border: 1px solid transparent; border-radius: 8px; padding: 0; }
+QPushButton#icon:hover { background: $surface2; border-color: $border; }
+QPushButton#icon:focus { border: 2px solid $accent; }
+
+QFrame#qrow { background: $surface; border: 1px solid $border; border-radius: 14px; }
+QFrame#qrow:hover { border-color: $border_strong; }
+QLabel#qthumb { background: $surface2; border-radius: 8px; }
+QLabel#qtitle { font-size: 10.5pt; font-weight: 600; }
+QLabel#qsub { color: $muted; font-size: 9pt; }
+QLabel#qstatus { color: $muted; font-size: 9pt; }
+QLabel#qstatus[state="ok"] { color: $success; }
+QLabel#qstatus[state="error"] { color: $danger; }
+QLabel#qpct { color: $accent_hover; font-size: 9pt; font-weight: 700; }
 """)
 
 

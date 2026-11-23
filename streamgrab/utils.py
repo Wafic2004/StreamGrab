@@ -26,11 +26,101 @@ def find_tool(name):
     return shutil.which(name)
 
 
+# ---------------------------------------------------------------- portable mode
+PORTABLE_MARKERS = ("portable", "portable.txt")
+_portable = None          # cached: "on" | "readonly" | "off"
+
+
+def _dir_writable(d):
+    try:
+        os.makedirs(d, exist_ok=True)
+        probe = os.path.join(d, ".sg_write_test")
+        with open(probe, "w") as f:
+            f.write("ok")
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
+def portable_state():
+    """'on' when a portable marker sits next to the app and its folder is writable,
+    'readonly' when the marker is there but the folder can't be written (normal mode is used),
+    'off' otherwise."""
+    global _portable
+    if _portable is None:
+        base = app_dir()
+        if any(os.path.isfile(os.path.join(base, m)) for m in PORTABLE_MARKERS):
+            _portable = "on" if _dir_writable(os.path.join(base, "data")) else "readonly"
+        else:
+            _portable = "off"
+    return _portable
+
+
+def is_portable():
+    return portable_state() == "on"
+
+
 def data_dir():
-    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-    d = os.path.join(base, "StreamGrab")
+    if is_portable():
+        d = os.path.join(app_dir(), "data")
+    else:
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        d = os.path.join(base, "StreamGrab")
     os.makedirs(d, exist_ok=True)
     return d
+
+
+def settings():
+    """App settings: the Windows registry normally, StreamGrab.ini next to the app in portable mode."""
+    from PySide6.QtCore import QSettings
+    if is_portable():
+        return QSettings(os.path.join(app_dir(), "StreamGrab.ini"), QSettings.Format.IniFormat)
+    return QSettings("StreamGrab", "StreamGrab")
+
+
+def app_command():
+    """Command that starts this app again (the .exe when frozen, python -m streamgrab from source)."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable]
+    exe = sys.executable
+    if os.name == "nt" and exe.lower().endswith("python.exe"):
+        w = exe[:-10] + "pythonw.exe"
+        if os.path.isfile(w):
+            exe = w
+    return [exe, "-m", "streamgrab"]
+
+
+def app_env():
+    env = dict(os.environ)
+    if not getattr(sys, "frozen", False):
+        env["PYTHONPATH"] = app_dir() + os.pathsep + env.get("PYTHONPATH", "")
+    return env
+
+
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def safe_folder_name(name):
+    """Folder name that Windows accepts, using the same look-alike characters yt-dlp uses for file names."""
+    table = {'<': '＜', '>': '＞', ':': '：', '"': '″', '/': '⧸', '\\': '⧹', '|': '｜', '?': '？', '*': '＊'}
+    out = "".join(table.get(c, c) for c in (name or "").strip())
+    out = "".join(c for c in out if ord(c) >= 32).strip(" .")
+    return out[:120] or "Playlist"
+
+
+def split_links(text):
+    """All YouTube links in a block of text (one per line, or separated by spaces/commas)."""
+    import re
+    found, seen = [], set()
+    for tok in re.split(r"[\s,;]+", text or ""):
+        tok = tok.strip().strip('"').strip("'").strip("<>")
+        if tok and is_media_link(tok):
+            url = normalize_url(tok)
+            if url not in seen:
+                seen.add(url)
+                found.append(url)
+    return found
 
 
 def default_download_dir():
@@ -137,7 +227,7 @@ def looks_like_url(text):
 
 def is_media_link(text):
     t = (text or "").strip().lower()
-    if " " in t or len(t) < 12:
+    if any(c.isspace() for c in t) or len(t) < 12:      # several links / text with a link in it
         return False
     return any(k in t for k in ("youtube.com/watch", "youtu.be/", "youtube.com/shorts/", "youtube.com/playlist",
                                 "youtube.com/live/", "music.youtube.com/"))

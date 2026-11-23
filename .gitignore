@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Build output
+build/
+dist/
+installer/Output/
+*.log
+pip.err
+
+# Helper binaries (download them, see bin/README.md)
+bin/*.exe
+
+# Test runs and local leftovers
+qa_runs/
+test_out*/
+backup_*/
+Test Documents/
+docs/*-1.xlsx
+docs/~$*
+*.part
+*.reg

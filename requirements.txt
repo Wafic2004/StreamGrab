@@ -1,0 +1,14 @@
+# Runtime
+PySide6==6.12.0
+yt-dlp==2026.10.26
+yt-dlp-ejs==0.8.0
+brotli==1.2.1
+certifi==2026.11.20
+pycryptodomex==3.24.2
+requests==2.34.2
+urllib3==2.8.0
+websockets==17.4
+
+# Build and tests
+pyinstaller==6.22.3
+mutagen==1.48.1
